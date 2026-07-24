@@ -206,7 +206,6 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
         if auth_header.startswith("Bearer "):
             api_key = auth_header.split("Bearer ")[1].strip()
             
-    # 【新增】：如果请求头里没有，尝试从浏览器网址参数 ?key=... 里面提取
     if not api_key:
         api_key = request.query_params.get("key")
         
@@ -214,28 +213,51 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
     if api_key and api_key.startswith("AIza"):
         path = request.url.path
         
-        # 3. 构造目标官方 URL (兼容官方OpenAI端点与原生端点)
+        # ====== 【核心修复】：专门拦截模型列表请求，把谷歌格式翻译成 OpenAI 格式 ======
+        if path.endswith("/v1/models"):
+            import json
+            target_url = "https://generativelanguage.googleapis.com/v1beta/models"
+            headers = {"x-goog-api-key": api_key}
+            
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(target_url, headers=headers)
+                if resp.status_code == 200:
+                    google_data = resp.json()
+                    openai_format_list = []
+                    # 遍历谷歌模型，转换成 Cherry Studio 认识的格式
+                    for m in google_data.get("models", []):
+                        model_id = m.get("name", "").replace("models/", "")
+                        openai_format_list.append({
+                            "id": model_id,
+                            "object": "model",
+                            "created": 1700000000,
+                            "owned_by": "google"
+                        })
+                    return Response(
+                        content=json.dumps({"object": "list", "data": openai_format_list}),
+                        media_type="application/json"
+                    )
+                else:
+                    return Response(content=resp.text, status_code=resp.status_code)
+        # ==============================================================================
+
+        # 3. 处理正常的聊天对话等请求
         if path.endswith("/v1/chat/completions"):
             target_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        elif path.endswith("/v1/models"):
-            target_url = "https://generativelanguage.googleapis.com/v1beta/openai/models"
         else:
             target_url = f"https://generativelanguage.googleapis.com{path}"
             
         if request.url.query:
             target_url += f"?{request.url.query}"
             
-        # 4. 构造请求头，过滤掉 host 防报错，过滤掉 authorization 防冲突
         headers = dict(request.headers)
         headers.pop("host", None)
-        # 统一把提取到的 Key 注入请求头，保证谷歌能识别
         headers["x-goog-api-key"] = api_key
         if "authorization" in headers:
             headers.pop("authorization")
             
         body = await request.body()
         
-        # 5. 发起透传请求
         client = httpx.AsyncClient()
         req = client.build_request(
             request.method,
@@ -246,7 +268,6 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
         
         resp = await client.send(req, stream=True)
         
-        # 6. 流式返回
         async def stream_generator():
             try:
                 async for chunk in resp.aiter_bytes():
@@ -255,7 +276,6 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
                 await resp.aclose()
                 await client.aclose()
                 
-        # 过滤掉分块传输相关的 HTTP 头信息
         resp_headers = {
             k: v for k, v in resp.headers.items() 
             if k.lower() not in ("content-length", "transfer-encoding", "content-encoding")
@@ -267,7 +287,7 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
             headers=resp_headers
         )
 
-    # 7. 非真实 API Key（例如系统的密码），放行给原系统处理
+    # 非真实 API Key 放行
     return await call_next(request)
 # 挂载路由器
 # OpenAI兼容路由 - 处理OpenAI格式请求
