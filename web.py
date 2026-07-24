@@ -200,20 +200,17 @@ app.add_middleware(
 async def gemini_direct_proxy_middleware(request: Request, call_next):
     # 1. 尝试多渠道提取 API Key
     api_key = request.headers.get("x-goog-api-key")
-    
     if not api_key:
         auth_header = request.headers.get("authorization", "")
         if auth_header.startswith("Bearer "):
             api_key = auth_header.split("Bearer ")[1].strip()
-            
     if not api_key:
         api_key = request.query_params.get("key")
         
-    # 2. 判断是否是真实的原生 Gemini API Key（特征是以 AIza 开头）
     if api_key and api_key.startswith("AIza"):
         path = request.url.path
         
-        # ====== 【核心修复】：专门拦截模型列表请求，把谷歌格式翻译成 OpenAI 格式 ======
+        # ====== 1. 模型列表专门翻译 ======
         if path.endswith("/v1/models"):
             import json
             target_url = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -224,7 +221,6 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
                 if resp.status_code == 200:
                     google_data = resp.json()
                     openai_format_list = []
-                    # 遍历谷歌模型，转换成 Cherry Studio 认识的格式
                     for m in google_data.get("models", []):
                         model_id = m.get("name", "").replace("models/", "")
                         openai_format_list.append({
@@ -239,10 +235,11 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
                     )
                 else:
                     return Response(content=resp.text, status_code=resp.status_code)
-        # ==============================================================================
 
-        # 3. 处理正常的聊天对话等请求
-        if path.endswith("/v1/chat/completions"):
+        # ====== 2. 聊天及其他请求转发 ======
+        is_openai_chat = path.endswith("/v1/chat/completions")
+        if is_openai_chat:
+            # 走谷歌官方的 OpenAI 兼容接口
             target_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         else:
             target_url = f"https://generativelanguage.googleapis.com{path}"
@@ -250,11 +247,18 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
         if request.url.query:
             target_url += f"?{request.url.query}"
             
+        # 【核心修复】：根据不同接口类型，发送不同的认证请求头
         headers = dict(request.headers)
-        headers.pop("host", None)
-        headers["x-goog-api-key"] = api_key
-        if "authorization" in headers:
-            headers.pop("authorization")
+        headers.pop("host", None) # 移除原host
+        
+        if is_openai_chat:
+            # OpenAI兼容接口【必须】保留 Bearer Token 格式
+            headers["authorization"] = f"Bearer {api_key}"
+            headers.pop("x-goog-api-key", None)
+        else:
+            # 谷歌原生接口使用 x-goog-api-key 格式
+            headers["x-goog-api-key"] = api_key
+            headers.pop("authorization", None)
             
         body = await request.body()
         
@@ -287,7 +291,7 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
             headers=resp_headers
         )
 
-    # 非真实 API Key 放行
+    # 非原生 API Key 放行
     return await call_next(request)
 # 挂载路由器
 # OpenAI兼容路由 - 处理OpenAI格式请求
