@@ -9,7 +9,9 @@ import gc
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response
+import httpx
+from fastapi import FastAPI, Response, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -194,7 +196,71 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.middleware("http")
+async def gemini_direct_proxy_middleware(request: Request, call_next):
+    # 提取 API Key
+    api_key = request.headers.get("x-goog-api-key")
+    auth_header = request.headers.get("authorization", "")
+    
+    if not api_key and auth_header.startswith("Bearer "):
+        api_key = auth_header.split("Bearer ")[1].strip()
+        
+    # 判断是否是真实的原生 Gemini API Key（特征是以 AIza 开头）
+    if api_key and api_key.startswith("AIza"):
+        path = request.url.path
+        
+        # 构造目标官方 URL (兼容官方OpenAI端点与原生端点)
+        if path.endswith("/v1/chat/completions"):
+            target_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        elif path.endswith("/v1/models"):
+            target_url = "https://generativelanguage.googleapis.com/v1beta/openai/models"
+        else:
+            target_url = f"https://generativelanguage.googleapis.com{path}"
+            
+        if request.url.query:
+            target_url += f"?{request.url.query}"
+            
+        # 构造请求头，过滤掉 host 防报错，过滤掉 authorization 防冲突
+        headers = dict(request.headers)
+        headers.pop("host", None)
+        headers["x-goog-api-key"] = api_key
+        if "authorization" in headers:
+            headers.pop("authorization")
+            
+        body = await request.body()
+        
+        client = httpx.AsyncClient()
+        req = client.build_request(
+            request.method,
+            target_url,
+            headers=headers,
+            content=body
+        )
+        
+        resp = await client.send(req, stream=True)
+        
+        async def stream_generator():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+                
+        # 过滤掉分块传输相关的 HTTP 头信息
+        resp_headers = {
+            k: v for k, v in resp.headers.items() 
+            if k.lower() not in ("content-length", "transfer-encoding", "content-encoding")
+        }
+        
+        return StreamingResponse(
+            stream_generator(),
+            status_code=resp.status_code,
+            headers=resp_headers
+        )
 
+    # 非真实 API Key（例如你系统的密码），放行给原系统处理
+    return await call_next(request)
 # 挂载路由器
 # OpenAI兼容路由 - 处理OpenAI格式请求
 app.include_router(geminicli_openai_router, prefix="", tags=["Geminicli OpenAI API"])
