@@ -198,18 +198,23 @@ app.add_middleware(
 )
 @app.middleware("http")
 async def gemini_direct_proxy_middleware(request: Request, call_next):
-    # 提取 API Key
+    # 1. 尝试多渠道提取 API Key
     api_key = request.headers.get("x-goog-api-key")
-    auth_header = request.headers.get("authorization", "")
     
-    if not api_key and auth_header.startswith("Bearer "):
-        api_key = auth_header.split("Bearer ")[1].strip()
+    if not api_key:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            api_key = auth_header.split("Bearer ")[1].strip()
+            
+    # 【新增】：如果请求头里没有，尝试从浏览器网址参数 ?key=... 里面提取
+    if not api_key:
+        api_key = request.query_params.get("key")
         
-    # 判断是否是真实的原生 Gemini API Key（特征是以 AIza 开头）
+    # 2. 判断是否是真实的原生 Gemini API Key（特征是以 AIza 开头）
     if api_key and api_key.startswith("AIza"):
         path = request.url.path
         
-        # 构造目标官方 URL (兼容官方OpenAI端点与原生端点)
+        # 3. 构造目标官方 URL (兼容官方OpenAI端点与原生端点)
         if path.endswith("/v1/chat/completions"):
             target_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         elif path.endswith("/v1/models"):
@@ -220,15 +225,17 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
         if request.url.query:
             target_url += f"?{request.url.query}"
             
-        # 构造请求头，过滤掉 host 防报错，过滤掉 authorization 防冲突
+        # 4. 构造请求头，过滤掉 host 防报错，过滤掉 authorization 防冲突
         headers = dict(request.headers)
         headers.pop("host", None)
+        # 统一把提取到的 Key 注入请求头，保证谷歌能识别
         headers["x-goog-api-key"] = api_key
         if "authorization" in headers:
             headers.pop("authorization")
             
         body = await request.body()
         
+        # 5. 发起透传请求
         client = httpx.AsyncClient()
         req = client.build_request(
             request.method,
@@ -239,6 +246,7 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
         
         resp = await client.send(req, stream=True)
         
+        # 6. 流式返回
         async def stream_generator():
             try:
                 async for chunk in resp.aiter_bytes():
@@ -259,7 +267,7 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
             headers=resp_headers
         )
 
-    # 非真实 API Key（例如你系统的密码），放行给原系统处理
+    # 7. 非真实 API Key（例如系统的密码），放行给原系统处理
     return await call_next(request)
 # 挂载路由器
 # OpenAI兼容路由 - 处理OpenAI格式请求
