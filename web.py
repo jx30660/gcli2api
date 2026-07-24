@@ -239,7 +239,6 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
         # ====== 2. 聊天及其他请求转发 ======
         is_openai_chat = path.endswith("/v1/chat/completions")
         if is_openai_chat:
-            # 走谷歌官方的 OpenAI 兼容接口
             target_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         else:
             target_url = f"https://generativelanguage.googleapis.com{path}"
@@ -247,20 +246,43 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
         if request.url.query:
             target_url += f"?{request.url.query}"
             
-        # 【核心修复】：根据不同接口类型，发送不同的认证请求头
         headers = dict(request.headers)
-        headers.pop("host", None) # 移除原host
+        headers.pop("host", None)
+        # 【重要改动】我们要修改请求体了，所以必须删掉原有的内容长度，让程序自动重新计算
+        headers.pop("content-length", None) 
         
         if is_openai_chat:
-            # OpenAI兼容接口【必须】保留 Bearer Token 格式
             headers["authorization"] = f"Bearer {api_key}"
             headers.pop("x-goog-api-key", None)
         else:
-            # 谷歌原生接口使用 x-goog-api-key 格式
             headers["x-goog-api-key"] = api_key
             headers.pop("authorization", None)
             
         body = await request.body()
+        
+        # 【核心修复：酒馆参数过滤器】
+        if is_openai_chat and body:
+            try:
+                import json
+                body_json = json.loads(body)
+                
+                # 移除酒馆常发、但谷歌官方不兼容的参数
+                unsupported_keys = [
+                    "frequency_penalty", 
+                    "presence_penalty", 
+                    "logit_bias", 
+                    "seed",
+                    "min_p",
+                    "top_a",
+                    "repetition_penalty"
+                ]
+                for key in unsupported_keys:
+                    body_json.pop(key, None)
+                    
+                # 将干净的参数重新打包成字节流
+                body = json.dumps(body_json).encode('utf-8')
+            except Exception:
+                pass # 如果解析失败，原样放行，不影响流程
         
         client = httpx.AsyncClient()
         req = client.build_request(
