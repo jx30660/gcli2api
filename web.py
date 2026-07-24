@@ -259,30 +259,35 @@ async def gemini_direct_proxy_middleware(request: Request, call_next):
             headers.pop("authorization", None)
             
         body = await request.body()
-        
-        # 【核心修复：酒馆参数过滤器】
+        # 【核心修复：增强版参数过滤器】
         if is_openai_chat and body:
             try:
                 import json
                 body_json = json.loads(body)
                 
-                # 移除酒馆常发、但谷歌官方不兼容的参数
+                # 1. 移除谷歌不支持的高级参数（包含最新版Cherry和酒馆的特殊参数）
                 unsupported_keys = [
-                    "frequency_penalty", 
-                    "presence_penalty", 
-                    "logit_bias", 
-                    "seed",
-                    "min_p",
-                    "top_a",
-                    "repetition_penalty"
+                    "frequency_penalty", "presence_penalty", "logit_bias", "seed",
+                    "min_p", "top_a", "repetition_penalty", 
+                    "serviceTier", "reasoning_effort", "verbosity"
                 ]
                 for key in unsupported_keys:
                     body_json.pop(key, None)
                     
-                # 将干净的参数重新打包成字节流
+                # 2. 动态清理所有值为 "[undefined]" 或 null 的垃圾参数
+                keys_to_delete = []
+                for k, v in body_json.items():
+                    # 抓出所有内容是 "[undefined]"、"undefined" 或者 null 的坏参数
+                    if v == "[undefined]" or v == "undefined" or v is None:
+                        keys_to_delete.append(k)
+                        
+                for k in keys_to_delete:
+                    body_json.pop(k, None)
+                    
+                # 将洗干净的参数重新打包成字节流
                 body = json.dumps(body_json).encode('utf-8')
             except Exception:
-                pass # 如果解析失败，原样放行，不影响流程
+                pass # 解析失败则原样放行
         
         client = httpx.AsyncClient()
         req = client.build_request(
